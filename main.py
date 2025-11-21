@@ -281,8 +281,7 @@ MODES = {
 }
 
 
-# --- Input System (支持手柄与全键位版) ---
-# --- Input System (带手柄支持 & 宽容缓冲版) ---
+# --- Input System (支持键盘、手柄按钮、手柄轴/扳机) ---
 class InputSystem:
     def __init__(self):
         # 蓄力计数
@@ -295,9 +294,9 @@ class InputSystem:
         self.retention_cnt_fwd = 0
         self.retention_cnt_down = 0
 
-        # ★★★ 新增：指令宽容缓冲计时器 ★★★
-        self.tolerance_fwd = 0  # 记录"前"松开后的一小段时间
-        self.tolerance_up = 0  # 记录"上"松开后的一小段时间
+        # 宽容缓冲
+        self.tolerance_fwd = 0
+        self.tolerance_up = 0
 
         self.socd_timer = 0
         self.prev_keys = {}
@@ -317,25 +316,63 @@ class InputSystem:
     def check_gamepad(self, action_name):
         if pygame.joystick.get_count() == 0: return False
         joy = pygame.joystick.Joystick(0)
+
+        # 1. 基础摇杆 (硬编码支持)
         DEADZONE = 0.5
-        hat_x, hat_y = joy.get_hat(0) if joy.get_numhats() > 0 else (0, 0)
         axis_x = joy.get_axis(0) if joy.get_numaxes() > 0 else 0
         axis_y = joy.get_axis(1) if joy.get_numaxes() > 1 else 0
 
         if action_name == "BACK":
-            if hat_x == -1 or axis_x < -DEADZONE: return True
+            if axis_x < -DEADZONE: return True
         elif action_name == "FWD":
-            if hat_x == 1 or axis_x > DEADZONE: return True
+            if axis_x > DEADZONE: return True
         elif action_name == "DOWN":
-            if hat_y == -1 or axis_y > DEADZONE: return True
+            if axis_y > DEADZONE: return True
         elif action_name == "UP":
-            if hat_y == 1 or axis_y < -DEADZONE: return True
-        elif action_name == "P":
-            for b in [2, 3, 4, 6]:
-                if b < joy.get_numbuttons() and joy.get_button(b): return True
-        elif action_name == "K":
-            for b in [0, 1, 5, 7]:
-                if b < joy.get_numbuttons() and joy.get_button(b): return True
+            if axis_y < -DEADZONE: return True
+
+        # 2. 自定义绑定 (按钮/十字键/扳机轴)
+        keys = KEY_CONFIG.get(action_name, [])
+
+        for k_str in keys:
+            # A. 按钮 (BTN_x)
+            if k_str.startswith("BTN_"):
+                try:
+                    btn_idx = int(k_str.split("_")[1])
+                    if btn_idx < joy.get_numbuttons() and joy.get_button(btn_idx):
+                        return True
+                except:
+                    pass
+
+            # B. 十字键 (HAT_x_DIR)
+            elif k_str.startswith("HAT_"):
+                try:
+                    parts = k_str.split("_")
+                    hat_idx = int(parts[1])
+                    direction = parts[2]
+                    if hat_idx < joy.get_numhats():
+                        hx, hy = joy.get_hat(hat_idx)
+                        if direction == "U" and hy == 1: return True
+                        if direction == "D" and hy == -1: return True
+                        if direction == "L" and hx == -1: return True
+                        if direction == "R" and hx == 1: return True
+                except:
+                    pass
+
+            # C. 轴/扳机 (AXIS_x_DIR)
+            elif k_str.startswith("AXIS_"):
+                try:
+                    parts = k_str.split("_")
+                    axis_idx = int(parts[1])
+                    direction = parts[2]
+
+                    if axis_idx < joy.get_numaxes():
+                        val = joy.get_axis(axis_idx)
+                        if direction == "+" and val > 0.6: return True
+                        if direction == "-" and val < -0.6: return True
+                except:
+                    pass
+
         return False
 
     def update(self, is_2p_side=False):
@@ -439,16 +476,13 @@ class InputSystem:
             logic_is_charged = self.charge_cnt_back >= self.req_back
             logic_ghost = (not clean_left and self.retention_cnt_back > 0)
 
-        # ★★★ 宽容度缓冲逻辑 (Input Buffer) ★★★
-        # 只要物理按了前(RAW)，就将缓冲池填满 (比如 5帧)
-        # 这样即使松手了，接下来的 5帧内 LENIENT_FWD 依然为 True
-
+        # 宽容度缓冲逻辑
         if logic_raw_fwd:
-            self.tolerance_fwd = 6  # 6帧宽容 (约0.1秒)
+            self.tolerance_fwd = 6
         elif self.tolerance_fwd > 0:
             self.tolerance_fwd -= 1
 
-        if raw_up:  # 纵向不分左右，直接用 raw_up
+        if raw_up:
             self.tolerance_up = 6
         elif self.tolerance_up > 0:
             self.tolerance_up -= 1
@@ -474,7 +508,6 @@ class InputSystem:
             "RAW_BACK": logic_raw_back,
             "RAW_FWD": logic_raw_fwd,
 
-            # ★★★ 返回宽容判定值 ★★★
             "LENIENT_FWD": self.tolerance_fwd > 0,
             "LENIENT_UP": self.tolerance_up > 0,
             "LENIENT_LEFT": getattr(self, 'tolerance_left', 0) > 0,
@@ -503,7 +536,6 @@ class InputSystem:
             "JP_P_IDXS": [], "JP_K_IDXS": [],
             "SOCD_H": socd_h, "SOCD_V": socd_v, "SOCD_FRAMES": self.socd_timer
         }
-
 
 class ErrorManager:
     def __init__(self):
@@ -633,16 +665,53 @@ def main():
             if event.type == pygame.QUIT: running = False
             if event.type == pygame.MOUSEBUTTONDOWN: clicked = True
             # 按键绑定逻辑
-            if binding_action is not None and event.type == pygame.KEYDOWN:
-                if event.key != pygame.K_ESCAPE:
-                    key_name = pygame.key.name(event.key)
-                    if key_name.lower() in VK_CODE:
-                        current_keys = KEY_CONFIG[binding_action[0]]
-                        slot_idx = binding_action[1]
-                        while len(current_keys) <= slot_idx: current_keys.append("None")
-                        current_keys[slot_idx] = key_name
-                binding_action = None
+            # ... 在 event 循环内部 ...
 
+            # === 改键逻辑 (支持 键盘 + 手柄按钮 + 手柄轴) ===
+            if binding_action is not None:
+                target_action, slot_idx = binding_action
+                new_key = None
+
+                # 1. 键盘
+                if event.type == pygame.KEYDOWN:
+                    if event.key != pygame.K_ESCAPE:
+                        new_key = pygame.key.name(event.key)
+
+                # 2. 手柄按钮
+                elif event.type == pygame.JOYBUTTONDOWN:
+                    new_key = f"BTN_{event.button}"
+
+                # 3. 手柄十字键
+                elif event.type == pygame.JOYHATMOTION:
+                    hx, hy = event.value
+                    hat_id = event.hat
+                    if hy == 1:
+                        new_key = f"HAT_{hat_id}_U"
+                    elif hy == -1:
+                        new_key = f"HAT_{hat_id}_D"
+                    elif hx == -1:
+                        new_key = f"HAT_{hat_id}_L"
+                    elif hx == 1:
+                        new_key = f"HAT_{hat_id}_R"
+
+                # 4. ★★★ 新增：手柄轴 (扳机键) ★★★
+                elif event.type == pygame.JOYAXISMOTION:
+                    # 只有当推到底时才算录入，防止摇杆轻微漂移导致误录
+                    axis_idx = event.axis
+                    val = event.value
+
+                    # 阈值设高一点(0.8)，保证是故意按下去的
+                    if val > 0.8:
+                        new_key = f"AXIS_{axis_idx}_+"
+                    elif val < -0.8:
+                        new_key = f"AXIS_{axis_idx}_-"
+
+                # --- 保存绑定 ---
+                if new_key:
+                    current_keys = KEY_CONFIG[target_action]
+                    while len(current_keys) <= slot_idx: current_keys.append("None")
+                    current_keys[slot_idx] = new_key
+                    binding_action = None
         # Tab 切换逻辑
         if clicked and my < TAB_H and binding_action is None:
             idx = mx // tab_width
