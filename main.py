@@ -125,56 +125,101 @@ COLOR_ICON_SYMBOL = (20, 20, 20)
 
 
 # --- 6. 音效引擎 ---
-# --- 6. 音效引擎 (优化版: 使用柔和的正弦波) ---
+# --- 6. 音效引擎 (支持多配置切换) ---
 class SoundEngine:
     def __init__(self):
+        self.enabled = True
+        self.profiles = [{"name": "内置合成 (Default)", "path": None}]  # 默认配置
+        self.current_idx = 0
+
         try:
-            # 初始化混音器
-            pygame.mixer.init(frequency=44100, size=-16, channels=1)
-            self.enabled = True
+            pygame.mixer.init(frequency=44100, size=-16, channels=2, buffer=512)
 
-            # OK音效: 高频正弦波 (880Hz), 短促, 清脆
-            self.snd_ok = self._generate_sine(880, 0.1, 0.2)
+            # 扫描 sounds 文件夹下的子文件夹
+            if os.path.exists("sounds"):
+                for item in os.listdir("sounds"):
+                    full_path = os.path.join("sounds", item)
+                    if os.path.isdir(full_path):
+                        self.profiles.append({"name": item, "path": full_path})
 
-            # 错误音效: 低频正弦波 (150Hz), 稍长, 类似 "波~" 的声音，不刺耳
-            self.snd_err = self._generate_sine(150, 0.25, 0.3)
+            # 加载默认
+            self.load_profile(0)
 
         except Exception as e:
             print(f"Audio Init Failed: {e}")
             self.enabled = False
 
+    def load_profile(self, idx):
+        """加载指定索引的音效包"""
+        self.current_idx = idx % len(self.profiles)
+        profile = self.profiles[self.current_idx]
+        base_path = profile["path"]
+
+        # 1. 尝试加载 ok.wav
+        self.snd_ok = None
+        if base_path:
+            self.snd_ok = self._load_external(os.path.join(base_path, "ok.wav"))
+
+        # 2. 尝试加载 err.wav
+        self.snd_err = None
+        if base_path:
+            self.snd_err = self._load_external(os.path.join(base_path, "err.wav"))
+
+        # 3. 如果没加载到，生成合成音作为保底
+        if self.snd_ok is None:
+            self.snd_ok = self._generate_sine(880, 0.1, 0.2)  # 高音
+
+        if self.snd_err is None:
+            self.snd_err = self._generate_sine(150, 0.25, 0.3)  # 低音
+
+        print(f"Loaded Audio Profile: {profile['name']}")
+
+    def next_profile(self):
+        """切换到下一个配置"""
+        new_idx = (self.current_idx + 1) % len(self.profiles)
+        self.load_profile(new_idx)
+
+    def prev_profile(self):
+        """切换到上一个配置"""
+        new_idx = (self.current_idx - 1) % len(self.profiles)
+        self.load_profile(new_idx)
+
+    def get_current_profile_name(self):
+        return self.profiles[self.current_idx]["name"]
+
+    def _load_external(self, path):
+        if os.path.exists(path):
+            try:
+                return pygame.mixer.Sound(path)
+            except:
+                return None
+        return None
+
     def _generate_sine(self, freq, duration, volume):
-        """生成柔和的正弦波"""
         sample_rate = 44100
         n_samples = int(sample_rate * duration)
         buf = array.array('h', [0] * n_samples)
         amplitude = int(32767 * volume)
-
         for i in range(n_samples):
-            # 计算正弦波: sin(2 * pi * freq * time)
             t = float(i) / sample_rate
             val = math.sin(2 * math.pi * freq * t)
-
-            # 添加淡入淡出 (Fade In/Out) 以避免爆音
             fade = 1.0
-            fade_len = 500  # 约10ms
-
-            # 开头淡入
-            if i < fade_len:
-                fade = i / fade_len
-            # 结尾淡出
-            elif i > n_samples - fade_len:
-                fade = (n_samples - i) / fade_len
-
+            if i < 500:
+                fade = i / 500
+            elif i > n_samples - 500:
+                fade = (n_samples - i) / 500
             buf[i] = int(val * amplitude * fade)
-
         return pygame.mixer.Sound(buffer=buf)
 
     def play_ok(self):
-        if self.enabled: self.snd_ok.play()
+        if self.enabled:
+            self.snd_ok.set_volume(0.6)
+            self.snd_ok.play()
 
     def play_err(self):
-        if self.enabled: self.snd_err.play()
+        if self.enabled:
+            self.snd_err.set_volume(0.8)
+            self.snd_err.play()
 
 
 # --- 7. 绘图引擎 ---
@@ -567,8 +612,9 @@ class ErrorManager:
             screen.blit(bg_surf, bg_rect)
             screen.blit(txt_surf, text_rect)
 
-
+import os
 def main():
+    os.environ["SDL_JOYSTICK_ALLOW_BACKGROUND_EVENTS"] = "1"
     pygame.init()
     # ★★★ 新增：初始化手柄模块 ★★★
     pygame.joystick.init()
@@ -1009,6 +1055,8 @@ def main():
         # === B. 按键设置界面 (SETTINGS - Tab 4) ===
         if mode_type == "SETTINGS":
             screen.fill(COLOR_BG)
+
+            # 1. 画顶部 Tab
             for i in range(TAB_COUNT):
                 rect = (i * tab_width, 0, tab_width, TAB_H)
                 col = COLOR_TAB_ACTIVE if i == current_mode_idx else COLOR_TAB_INACTIVE
@@ -1018,48 +1066,149 @@ def main():
                 screen.blit(label, label.get_rect(center=(rect[0] + rect[2] // 2, rect[1] + rect[3] // 2)))
             pygame.draw.line(screen, COLOR_JUDGE_LINE, (0, TAB_H), (WIN_W, TAB_H), 2)
 
-            actions = [
+            # --- 智能布局计算 ---
+            # 使用 min 确保在窄屏下按钮不会过大
+            scale = min(WIN_W / REF_WIDTH, WIN_H / REF_HEIGHT)
+            # 保证 scale 不会太小导致字看不清
+            scale = max(0.6, scale)
+
+            margin_left = int(WIN_W * 0.05)
+            center_x = WIN_W // 2
+
+            # 判断是否使用双栏布局 (阈值: 700px 宽)
+            # 如果窗口宽度 > 700 * 缩放系数，说明够宽，可以用双栏
+            use_dual_column = WIN_W > (700 * scale)
+
+            # =======================================
+            # 第一部分：音效包设置
+            # =======================================
+            section1_y = TAB_H + int(20 * scale)
+
+            screen.blit(font_alert.render("1. 音效设置", True, (255, 255, 255)), (margin_left, section1_y))
+
+            # 按钮布局
+            btn_area_y = section1_y + int(40 * scale)
+            btn_h = int(30 * scale)
+            btn_w = int(40 * scale)
+            # 按钮距离中心的偏移量
+            btn_offset = int(140 * scale)
+
+            btn_prev_rect = pygame.Rect(center_x - btn_offset - btn_w, btn_area_y, btn_w, btn_h)
+            btn_next_rect = pygame.Rect(center_x + btn_offset, btn_area_y, btn_w, btn_h)
+
+            if clicked:
+                if btn_prev_rect.collidepoint(mx, my):
+                    sound_engine.prev_profile()
+                    sound_engine.play_ok()
+                elif btn_next_rect.collidepoint(mx, my):
+                    sound_engine.next_profile()
+                    sound_engine.play_ok()
+
+            pygame.draw.rect(screen, (60, 60, 60), btn_prev_rect)
+            pygame.draw.rect(screen, (60, 60, 60), btn_next_rect)
+            pygame.draw.rect(screen, (150, 150, 150), btn_prev_rect, 1)
+            pygame.draw.rect(screen, (150, 150, 150), btn_next_rect, 1)
+
+            screen.blit(font_bold.render("<", True, (255, 255, 255)),
+                        font_bold.render("<", True, (255, 255, 255)).get_rect(center=btn_prev_rect.center))
+            screen.blit(font_bold.render(">", True, (255, 255, 255)),
+                        font_bold.render(">", True, (255, 255, 255)).get_rect(center=btn_next_rect.center))
+
+            # 音效名
+            profile_name = sound_engine.get_current_profile_name()
+            txt_surf = font_bold.render(profile_name, True, (0, 255, 255))
+            screen.blit(txt_surf, txt_surf.get_rect(center=(center_x, btn_area_y + btn_h // 2)))
+
+            # =======================================
+            # 第二部分：按键绑定 (响应式)
+            # =======================================
+            section2_y = btn_area_y + btn_h + int(40 * scale)
+
+            screen.blit(font_alert.render("2. 按键绑定", True, (255, 255, 255)), (margin_left, section2_y))
+
+            # 数据
+            dir_actions = [
                 ("后 (Back)", "BACK", 2), ("前 (Fwd)", "FWD", 2),
-                ("下 (Down)", "DOWN", 2), ("上 (Up)", "UP", 2),
+                ("下 (Down)", "DOWN", 2), ("上 (Up)", "UP", 2)
+            ]
+            atk_actions = [
                 ("拳 (Punch)", "P", 3), ("脚 (Kick)", "K", 3)
             ]
 
-            line_gap = int(45 * (WIN_H / REF_HEIGHT))
-            start_y = int(TAB_H * 2)
-            col1_x = 50
-            col2_x = 200
-            slot_w = 100
-            slot_h = int(35 * (WIN_H / REF_HEIGHT))
-            gap = 10
+            # 尺寸参数
+            start_bind_y = section2_y + int(35 * scale)
+            line_gap = int(40 * scale)
+            slot_w = int(85 * scale)  # 稍微调小一点，适应窄屏
+            slot_h = int(28 * scale)
+            slot_gap = int(8 * scale)
 
-            screen.blit(font.render("点击槽位修改按键 (支持多键位绑定)", True, (200, 200, 200)), (50, start_y - 30))
+            # 绘制函数 (复用)
+            def draw_binding_group(actions, start_x, start_y):
+                nonlocal binding_action
+                current_y = start_y
 
-            for i, (label_text, act_key, num_slots) in enumerate(actions):
-                row_y = start_y + i * line_gap
-                lbl = font_bold.render(label_text, True, (255, 255, 255))
-                screen.blit(lbl, (col1_x, row_y + (slot_h // 2 - 8)))
+                label_w = int(90 * scale)  # 标签预留宽度
 
-                current_keys = KEY_CONFIG[act_key]
-                for slot_idx in range(num_slots):
-                    btn_rect = pygame.Rect(col2_x + slot_idx * (slot_w + gap), row_y, slot_w, slot_h)
-                    is_hover = btn_rect.collidepoint(mx, my)
+                for i, (label_text, act_key, num_slots) in enumerate(actions):
+                    # 标签
+                    lbl = font_bold.render(label_text, True, (200, 200, 200))
+                    screen.blit(lbl, (start_x, current_y + (slot_h - lbl.get_height()) // 2))
 
-                    if binding_action == (act_key, slot_idx):
-                        bg_c = COLOR_BTN_WAIT
-                        txt_str = "..."
-                    else:
-                        bg_c = COLOR_BTN_HOVER if is_hover else COLOR_BTN_IDLE
-                        if slot_idx < len(current_keys):
-                            txt_str = current_keys[slot_idx]
+                    current_keys = KEY_CONFIG[act_key]
+
+                    # 槽位
+                    slots_start_x = start_x + label_w
+                    for slot_idx in range(num_slots):
+                        btn_rect = pygame.Rect(slots_start_x + slot_idx * (slot_w + slot_gap), current_y, slot_w,
+                                               slot_h)
+                        is_hover = btn_rect.collidepoint(mx, my)
+
+                        if binding_action == (act_key, slot_idx):
+                            bg_c = COLOR_BTN_WAIT
+                            txt_str = "..."
                         else:
-                            txt_str = "--"
+                            bg_c = COLOR_BTN_HOVER if is_hover else COLOR_BTN_IDLE
+                            if slot_idx < len(current_keys):
+                                txt_str = current_keys[slot_idx]
+                            else:
+                                txt_str = "--"
 
-                    pygame.draw.rect(screen, bg_c, btn_rect)
-                    pygame.draw.rect(screen, (150, 150, 150), btn_rect, 1)
-                    t_surf = font.render(str(txt_str), True, (255, 255, 255))
-                    screen.blit(t_surf, t_surf.get_rect(center=btn_rect.center))
+                        pygame.draw.rect(screen, bg_c, btn_rect)
+                        pygame.draw.rect(screen, (150, 150, 150), btn_rect, 1)
 
-                    if clicked and is_hover and binding_action is None: binding_action = (act_key, slot_idx)
+                        render_txt = str(txt_str)
+                        if len(render_txt) > 8: render_txt = render_txt[:7] + "."
+                        t_surf = font.render(render_txt, True, (255, 255, 255))
+                        screen.blit(t_surf, t_surf.get_rect(center=btn_rect.center))
+
+                        if clicked and is_hover and binding_action is None: binding_action = (act_key, slot_idx)
+
+                    current_y += line_gap
+                return current_y
+
+            # --- 布局分支 ---
+            if use_dual_column:
+                # === 双栏模式 (宽屏) ===
+                col1_x = margin_left
+                # 右栏从屏幕 50% + 20px 处开始
+                col2_x = center_x + int(20 * scale)
+
+                # 左边画方向
+                draw_binding_group(dir_actions, col1_x, start_bind_y)
+                # 右边画拳脚 (Y轴对齐)
+                draw_binding_group(atk_actions, col2_x, start_bind_y)
+
+            else:
+                # === 单栏模式 (窄屏) ===
+                # 所有的都在左边，上下堆叠
+                col_x = margin_left
+
+                # 画方向
+                end_y = draw_binding_group(dir_actions, col_x, start_bind_y)
+
+                # 画拳脚 (接在方向下面)
+                # 加一点间距
+                draw_binding_group(atk_actions, col_x, end_y + int(10 * scale))
 
             pygame.display.flip()
             clock.tick(30)
